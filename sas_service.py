@@ -3,6 +3,7 @@ import re
 import ctypes
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import quote
 
@@ -11,6 +12,10 @@ from dotenv import load_dotenv
 
 from schemas import ArtifactItem, ExecuteRequest, ExecuteResponse
 
+# 运行时目录约定：
+# - runtime/<request_id>/execute.log: 原始执行日志
+# - runtime/<request_id>/output/*: 可下载产物
+# - runtime/tmp: saspy 临时文件目录
 load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -25,10 +30,12 @@ SAS_PW = os.getenv("SAS_PW", "").strip()
 
 
 def safe_filename(name: str) -> str:
+    # 只保留文件名，防止路径注入
     return Path(name).name
 
 
 def get_artifact_path(request_id: str, filename: str) -> Path:
+    # 下载接口路径解析：只允许 runtime/<request_id>/output 下的相对路径
     normalized = _normalize_artifact_relpath(filename)
     base_dir = (RUNTIME_DIR / request_id / "output").resolve()
     target = (base_dir / Path(normalized.replace("\\", "/"))).resolve()
@@ -41,36 +48,63 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
     request_dir = RUNTIME_DIR / request_id
     request_dir.mkdir(parents=True, exist_ok=True)
 
+    total_started_at = perf_counter()
     output_dir = _normalize_output_dir(payload.output_dir)
     sas = None
     com_initialized = False
     temp_env_backup: dict[str, str | None] = {}
     log_text = ""
     log_artifact_path: Path | None = None
+    timings: dict[str, float] = {}
     try:
-        # å°† saspy ä¸´æ—¶æ–‡ä»¶å›ºå®šåˆ°é¡¹ç›® runtime ç›®å½•ï¼Œé¿å…ç³»ç»Ÿä¸´æ—¶ç›®å½•æƒé™/ç­–ç•¥é—®é¢˜ã€‚
+        # 1) 固定 saspy 临时目录，避免系统临时目录权限/策略问题
+        t = perf_counter()
         temp_env_backup = _set_temp_dir_for_saspy()
-        # Windows/IOM åœºæ™¯ä¸‹ï¼Œå½“å‰çº¿ç¨‹éœ€å…ˆå®Œæˆ COM åˆå§‹åŒ–å†åˆ›å»º SASsessionã€‚
+        timings["set_temp_dir"] = perf_counter() - t
+        # 2) Windows/IOM 下需先初始化 COM，再创建 SASsession
+        t = perf_counter()
         com_initialized = _co_initialize_for_windows()
+        timings["co_initialize"] = perf_counter() - t
+        t = perf_counter()
         sas = saspy.SASsession(**_sas_config())
-        _ensure_remote_output_dir(sas, output_dir)
-        _ensure_remote_output_layout(sas, output_dir)
+        timings["create_session"] = perf_counter() - t
+        # 3) 确保远端输出目录及标准子目录存在
+        t = perf_counter()
+        _ensure_remote_output_structure(sas, output_dir)
+        timings["ensure_output_structure"] = perf_counter() - t
 
+        # 4) 执行 SAS 代码并落盘日志
+        t = perf_counter()
         submit_result = sas.submit(payload.code)
+        timings["sas_submit"] = perf_counter() - t
         log_text = submit_result.get("LOG", "")
+        t = perf_counter()
         log_artifact_path = _write_log(log_text, request_dir, request_id)
+        timings["write_log"] = perf_counter() - t
 
-        _, exists_after, after_err = _snapshot_remote_dir(sas, output_dir)
+        # 5) 执行后一次递归扫描获取全量文件，并统计耗时
+        t = perf_counter()
+        all_files, exists_after, after_err = _snapshot_remote_dir(sas, output_dir)
+        timings["recursive_scan"] = perf_counter() - t
         if not exists_after:
             detail = f"output_dir became unavailable after execution: {output_dir}"
             if after_err:
                 detail = f"{detail}; SAS detail: {after_err}"
             raise RuntimeError(detail)
 
-        all_files = _collect_output_files(sas, output_dir)
+        # 6) 下载产物（含子目录）
+        t = perf_counter()
         artifacts = _download_artifacts(sas, request_id, output_dir, all_files)
+        timings["download_artifacts"] = perf_counter() - t
         if log_artifact_path is not None:
             artifacts.append(_build_log_artifact(request_id, log_artifact_path))
+        timings["total"] = perf_counter() - total_started_at
+        print(
+            "[phase_timing] "
+            f"request_id={request_id} "
+            + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
+            + f" file_count={len(all_files)}"
+        )
         return ExecuteResponse(
             success=True,
             request_id=request_id,
@@ -78,12 +112,23 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
             artifacts=artifacts,
         )
     except Exception:
+        # 异常场景也尽量保留日志，方便定位问题
         _write_log(log_text, request_dir, request_id)
+        timings["total"] = perf_counter() - total_started_at
+        if timings:
+            print(
+                "[phase_timing] "
+                f"request_id={request_id} "
+                + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
+                + " status=failed"
+            )
         raise
     finally:
         if sas is not None:
             try:
+                t = perf_counter()
                 sas.endsas()
+                timings["endsas"] = perf_counter() - t
             except Exception:
                 pass
         _co_uninitialize_for_windows(com_initialized)
@@ -93,7 +138,7 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
 def _co_initialize_for_windows() -> bool:
     if os.name != "nt":
         return False
-    # CoInitialize è¿”å›ž 0/1 è¡¨ç¤ºå½“å‰çº¿ç¨‹ COM å¯ç”¨ï¼ˆS_OK/S_FALSEï¼‰ã€‚
+    # CoInitialize 返回 0/1 表示当前线程 COM 可用（S_OK/S_FALSE）
     hr = ctypes.windll.ole32.CoInitialize(None)
     if hr not in (0, 1):
         raise RuntimeError(f"CoInitialize failed, HRESULT={hr}")
@@ -106,7 +151,7 @@ def _co_uninitialize_for_windows(initialized: bool) -> None:
 
 
 def _set_temp_dir_for_saspy() -> dict[str, str | None]:
-    # å…ˆå¤‡ä»½å†è¦†ç›–ä¸´æ—¶ç›®å½•çŽ¯å¢ƒå˜é‡ï¼Œç¡®ä¿ saspy åœ¨å¯æŽ§ç›®å½•åˆ›å»ºä¸´æ—¶æ–‡ä»¶ã€‚
+    # 先备份，再覆盖临时目录环境变量，确保 saspy 在可控目录创建临时文件
     backup = {
         "TMP": os.environ.get("TMP"),
         "TEMP": os.environ.get("TEMP"),
@@ -128,7 +173,7 @@ def _restore_temp_dir(backup: dict[str, str | None]) -> None:
 
 
 def _sas_config() -> dict[str, str]:
-    # ä»…ä½¿ç”¨é¡¹ç›®å†… sascfg.pyï¼Œä¸å†å¤åˆ¶æˆ–åŠ¨æ€æŒ‡å®š cfgfileã€‚
+    # 仅使用项目内 sascfg.py，不再复制或动态指定 cfgfile
     sascfg = ROOT_DIR / "sascfg.py"
     if not sascfg.exists():
         raise RuntimeError(f"sascfg.py not found: {sascfg}")
@@ -163,6 +208,7 @@ def _join_remote_path(output_dir: str, filename: str) -> str:
 
 
 def _normalize_artifact_relpath(path: str) -> str:
+    # 产物路径安全规则：必须是相对路径，且不允许 .. 穿越
     normalized = str(path or "").strip().replace("/", "\\").strip("\\")
     if not normalized:
         raise ValueError("artifact path cannot be empty")
@@ -176,6 +222,7 @@ def _normalize_artifact_relpath(path: str) -> str:
 
 
 def _check_remote_dir_exists(sas: saspy.SASsession, path: str) -> tuple[bool, str]:
+    # 在 SAS 侧检查目录是否可访问，并从日志中解析状态码/错误信息
     quoted = _sas_quote(path)
     code = f"""
 %global _codx_dir_exists;
@@ -210,6 +257,7 @@ run;
 
 
 def _create_remote_dir(sas: saspy.SASsession, parent: str, leaf: str) -> str:
+    # 通过 SAS dcreate 在指定 parent 下创建 leaf 目录
     quoted_parent = _sas_quote(parent)
     quoted_leaf = _sas_quote(leaf)
     code = f"""
@@ -255,69 +303,129 @@ run;
     return "unknown SAS mkdir error"
 
 
-def _ensure_remote_output_dir(sas: saspy.SASsession, output_dir: str) -> None:
+def _ensure_remote_output_structure(sas: saspy.SASsession, output_dir: str) -> None:
+    # 一次性确保 output_dir 以及标准子目录存在
     normalized = output_dir.strip().replace("/", "\\").rstrip("\\")
     if not normalized:
         raise ValueError("output_dir cannot be empty")
 
-    exists, _ = _check_remote_dir_exists(sas, normalized)
-    if exists:
-        return
+    targets = [
+        normalized,
+        _join_remote_path(normalized, "data"),
+        _join_remote_path(normalized, "data\\adam"),
+        _join_remote_path(normalized, "data\\tlf"),
+        _join_remote_path(normalized, "program"),
+        _join_remote_path(normalized, "report"),
+    ]
+    _ensure_remote_dirs_batch(sas, targets)
+    exists_after, err_after = _check_remote_dir_exists(sas, normalized)
+    if not exists_after:
+        detail = f"Failed to create output_dir {normalized}"
+        if err_after:
+            detail = f"{detail}; SAS detail: {err_after}"
+        raise RuntimeError(detail)
 
-    # Create each missing level from drive root, e.g. D:\a\b\c
+
+def _expand_dir_chain(path: str) -> list[str]:
+    normalized = path.strip().replace("/", "\\").rstrip("\\")
+    if not normalized:
+        return []
     segments = [seg for seg in normalized.split("\\") if seg]
     if not segments:
-        raise RuntimeError(f"Invalid output_dir: {output_dir}")
+        return []
 
     drive_pattern = re.compile(r"^[A-Za-z]:$")
-    if drive_pattern.match(segments[0]):
-        current = segments[0] + "\\"
-        index = 1
-    else:
-        # Fallback: only attempt to create the final leaf under existing parent.
-        parent = str(Path(normalized).parent).replace("/", "\\")
-        leaf = Path(normalized).name
-        if not leaf or not parent:
-            raise RuntimeError(f"Unsupported output_dir format: {output_dir}")
-        msg = _create_remote_dir(sas, parent, leaf)
-        if msg:
-            raise RuntimeError(f"Failed to create output_dir {normalized}: {msg}")
-        exists_after, err_after = _check_remote_dir_exists(sas, normalized)
-        if not exists_after:
-            detail = f"Failed to create output_dir {normalized}"
-            if err_after:
-                detail = f"{detail}; SAS detail: {err_after}"
-            raise RuntimeError(detail)
+    if not drive_pattern.match(segments[0]):
+        return [normalized]
+
+    chain: list[str] = []
+    current = segments[0] + "\\"
+    for leaf in segments[1:]:
+        parent = current.rstrip("\\")
+        current = f"{parent}\\{leaf}" if parent else leaf
+        chain.append(current)
+    return chain or [normalized]
+
+
+def _ensure_remote_dirs_batch(sas: saspy.SASsession, paths: list[str]) -> None:
+    # 将多个路径展开为有序目录链，并在一次 sas.submit 中批量创建缺失目录
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        for candidate in _expand_dir_chain(raw):
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(candidate)
+
+    if not ordered:
         return
 
-    for leaf in segments[index:]:
-        parent = current.rstrip("\\")
-        candidate = f"{parent}\\{leaf}" if parent else leaf
-        exists_candidate, _ = _check_remote_dir_exists(sas, candidate)
-        if not exists_candidate:
-            msg = _create_remote_dir(sas, parent if parent else current, leaf)
-            if msg:
-                raise RuntimeError(f"Failed to create output_dir segment {candidate}: {msg}")
-            exists_after, err_after = _check_remote_dir_exists(sas, candidate)
-            if not exists_after:
-                detail = f"Failed to create output_dir segment {candidate}"
-                if err_after:
-                    detail = f"{detail}; SAS detail: {err_after}"
-                raise RuntimeError(detail)
-        current = candidate
+    blocks: list[str] = []
+    for target in ordered:
+        parent = str(Path(target).parent).replace("/", "\\").rstrip("\\")
+        leaf = Path(target).name
+        if not parent or not leaf:
+            continue
+        q_target = _sas_quote(target)
+        q_parent = _sas_quote(parent)
+        q_leaf = _sas_quote(leaf)
+        blocks.append(
+            f"""
+    dir = '{q_target}';
+    rc = filename('_cdxdir', dir);
+    did = dopen('_cdxdir');
+    if did > 0 then do;
+        rc = dclose(did);
+    end;
+    else do;
+        parent = '{q_parent}';
+        leaf = '{q_leaf}';
+        rc = filename('_cdxpar', parent);
+        pdid = dopen('_cdxpar');
+        if pdid <= 0 then do;
+            msg = cats('parent_not_accessible: ', parent, ' | ', sysmsg());
+            put 'CODX_BATCH_ERR=' msg;
+            call symputx('_codx_batch_ok', '0', 'G');
+        end;
+        else do;
+            rc = dclose(pdid);
+            parent = pathname('_cdxpar');
+            created = dcreate(leaf, parent);
+            if missing(created) then do;
+                msg = cats('dcreate_failed: ', dir, ' | ', sysmsg());
+                put 'CODX_BATCH_ERR=' msg;
+                call symputx('_codx_batch_ok', '0', 'G');
+            end;
+        end;
+        rc = filename('_cdxpar');
+    end;
+    rc = filename('_cdxdir');
+"""
+        )
 
+    if not blocks:
+        return
 
-def _ensure_remote_output_layout(sas: saspy.SASsession, output_dir: str) -> None:
-    required_subdirs = [
-        "data",
-        "data\\adam",
-        "data\\tlf",
-        "program",
-        "report",
-    ]
-    for subdir in required_subdirs:
-        target = _join_remote_path(output_dir, subdir)
-        _ensure_remote_output_dir(sas, target)
+    code = f"""
+%global _codx_batch_ok;
+%let _codx_batch_ok=1;
+data _null_;
+    length dir parent leaf created msg $512;
+    length rc did pdid 8;
+{''.join(blocks)}
+run;
+%put CODX_BATCH_OK=&_codx_batch_ok;
+"""
+    submit_result = sas.submit(code)
+    log_text = submit_result.get("LOG", "")
+    ok = bool(re.search(r"CODX_BATCH_OK=1", log_text))
+    if ok:
+        return
+    err_match = re.findall(r"CODX_BATCH_ERR=([^\r\n]*)", log_text)
+    err_text = err_match[-1].strip() if err_match else "unknown SAS batch mkdir error"
+    raise RuntimeError(f"Failed to create output directory structure: {err_text}")
 
 
 def _parse_dir_exists(log_text: str) -> bool:
@@ -350,6 +458,7 @@ def _parse_dir_error(log_text: str) -> str:
 def _snapshot_remote_dir_flat(
     sas: saspy.SASsession, output_dir: str
 ) -> tuple[list[dict[str, Any]], bool, str]:
+    # 非递归扫描：仅获取当前目录第一层文件
     quoted_dir = _sas_quote(output_dir)
     code = f"""
 %global _codx_dir_exists;
@@ -440,6 +549,7 @@ run;
 
 
 def _snapshot_remote_dir(sas: saspy.SASsession, output_dir: str) -> tuple[list[dict[str, Any]], bool, str]:
+    # 递归扫描：用于确认目录可访问并支持后续全量收集
     quoted_dir = _sas_quote(output_dir)
     code = f"""
 %global _codx_dir_exists;
@@ -575,6 +685,7 @@ run;
 
 
 def _collect_output_files(sas: saspy.SASsession, output_dir: str) -> list[dict[str, Any]]:
+    # 按约定目录收集文件：根目录、data、data/adam、data/tlf、program、report
     targets = [
         ("", output_dir),
         ("data", _join_remote_path(output_dir, "data")),
@@ -603,7 +714,7 @@ def _collect_output_files(sas: saspy.SASsession, output_dir: str) -> list[dict[s
 
 
 def _diff_artifacts(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # â€œå˜æ›´æ–‡ä»¶â€å®šä¹‰ï¼šæ–‡ä»¶æ–°å¢ž/ç¼ºå¤±ï¼Œæˆ– (size, modified_time) å‘ç”Ÿå˜åŒ–ã€‚
+    # “变更文件”定义：文件新增/缺失，或 (size, modified_time) 发生变化
     before_map: dict[str, tuple[int, str]] = {}
     for item in before:
         before_map[item["filename"]] = (item["size"], item["modified_time"])
@@ -619,6 +730,7 @@ def _diff_artifacts(before: list[dict[str, Any]], after: list[dict[str, Any]]) -
 
 
 def _write_log(log_text: str, request_dir: Path, request_id: str) -> Path:
+    # 同时写 execute.log 与可下载日志文件（sas_log_<request_id>.log）
     log_path = request_dir / "execute.log"
     log_path.write_text(log_text, encoding="utf-8", errors="replace")
     local_output_dir = request_dir / "output"
@@ -647,6 +759,7 @@ def _write_compare_log(
     after: list[dict[str, Any]],
     changed: list[dict[str, Any]],
 ) -> None:
+    # 调试辅助：写入前后快照对比表（当前默认不对外暴露）
     before_map: dict[str, tuple[int, str]] = {
         item["filename"]: (item["size"], item["modified_time"]) for item in before
     }
@@ -687,6 +800,7 @@ def _download_artifacts(
     output_dir: str,
     changed_files: list[dict[str, Any]],
 ) -> list[ArtifactItem]:
+    # 按相对路径下载远端文件，并在本地保留目录结构
     local_output_dir = RUNTIME_DIR / request_id / "output"
     local_output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[ArtifactItem] = []

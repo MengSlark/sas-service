@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import requests
@@ -57,8 +58,9 @@ def run(
     output_dir: str,
     input_paths: list[str],
     timeout: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], float]:
     cwd = Path.cwd()
+
     health = requests.get(f"{base_url}/health", timeout=100)
     _ensure_ok(health, "health check")
 
@@ -71,7 +73,11 @@ def run(
         "output_dir": output_dir,
         "input_paths": input_paths,
     }
+
+    t1 = perf_counter()
     resp = requests.post(f"{base_url}/execute", json=payload, timeout=timeout)
+    execute_submit_seconds = perf_counter() - t1
+
     if resp.status_code >= 400:
         detail, request_id, log_text = _extract_error_info(resp)
         if not log_text:
@@ -80,6 +86,7 @@ def run(
         raise RuntimeError(
             f"execute failed: HTTP {resp.status_code}. {detail} (log_file: {log_file})"
         )
+
     data = resp.json()
     request_id = str(data.get("request_id") or "")
     log_text = str(data.get("log", ""))
@@ -111,7 +118,7 @@ def run(
         "log_file": log_file,
         "saved_files": saved_files,
         "artifacts": artifacts,
-    }
+    }, round(execute_submit_seconds, 3)
 
 
 def main() -> None:
@@ -123,13 +130,14 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=600, help="HTTP timeout in seconds")
     args = parser.parse_args()
 
-    result = run(
+    result, execute_submit_seconds = run(
         base_url=args.base_url.rstrip("/"),
         code_file=Path(args.code_file),
         output_dir=args.output_dir,
         input_paths=args.input_path,
         timeout=args.timeout,
     )
+    print(f"execute_submit_seconds: {execute_submit_seconds}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
