@@ -1,0 +1,4 @@
+interface:
+  display_name: "sas-executor"
+  short_description: "Run SAS via API and save all returned artifacts locally."
+  default_prompt: "Use this skill to execute SAS code through /execute and download every artifact to the current directory."
