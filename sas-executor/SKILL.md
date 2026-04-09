@@ -1,5 +1,5 @@
 ---
-name: sas-executor-dev
+name: sas-executor
 description: 在执行 SAS 前，先按项目目录规范识别并改写输入输出路径，完成自检后再调用 `/execute` 并下载全部产物到当前工作目录。
 ---
 
