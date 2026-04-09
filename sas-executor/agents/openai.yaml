@@ -1,4 +1,4 @@
 interface:
-  display_name: "sas-executor"
+  display_name: "sas-executor-dev"
   short_description: "先按项目目录规范改写并校验 SAS 输入输出路径，再通过 API 执行并将产物保存到本地。"
-  default_prompt: "当用户上传 .sas 文件，或明确要求执行/运行 SAS，或希望先按项目目录规范改写 SAS 的输入输出路径再执行并下载全部产物时，使用此技能。先分析路径、推断项目名称、仅改写路径相关内容；只有在校验通过后才调用 /execute。"
+  default_prompt: "当用户上传 .sas 文件，或明确要求执行/运行 SAS，或希望先按项目目录规范改写 SAS 的输入输出路径再执行并下载全部产物时，使用此技能。先分析路径、推断项目名称、仅改写路径相关内容；若读取链路出现 `(truncated)` 等截断标记，必须先重新完整读取源文件并完成完整性确认，再继续改写；只有在全部校验通过后才调用 /execute。"
