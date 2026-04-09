@@ -1,4 +1,4 @@
 interface:
   display_name: "sas-executor"
-  short_description: "Run SAS via API and save all returned artifacts locally."
-  default_prompt: "Use this skill to execute SAS code through /execute and download every artifact to the current directory."
+  short_description: "先按项目目录规范改写并校验 SAS 输入输出路径，再通过 API 执行并将产物保存到本地。"
+  default_prompt: "当用户上传 .sas 文件，或明确要求执行/运行 SAS，或希望先按项目目录规范改写 SAS 的输入输出路径再执行并下载全部产物时，使用此技能。先分析路径、推断项目名称、仅改写路径相关内容；只有在校验通过后才调用 /execute。"
