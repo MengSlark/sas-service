@@ -1,7 +1,6 @@
 ﻿import os
 import re
 import ctypes
-from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -13,8 +12,8 @@ from dotenv import load_dotenv
 from schemas import ArtifactItem, ExecuteRequest, ExecuteResponse
 
 # 运行时目录约定：
-# - runtime/<request_id>/execute.log: 原始执行日志
-# - runtime/<request_id>/output/*: 可下载产物
+# - runtime/<request_id>/execute.log: 执行日志（唯一日志文件，同时可下载）
+# - runtime/<request_id>/output/*: 其他可下载产物
 # - runtime/tmp: saspy 临时文件目录
 load_dotenv()
 
@@ -35,8 +34,12 @@ def safe_filename(name: str) -> str:
 
 
 def get_artifact_path(request_id: str, filename: str) -> Path:
-    # 下载接口路径解析：只允许 runtime/<request_id>/output 下的相对路径
+    # 下载接口路径解析：
+    # 1) execute.log 映射到 runtime/<request_id>/execute.log
+    # 2) 其他路径只允许 runtime/<request_id>/output 下的相对路径
     normalized = _normalize_artifact_relpath(filename)
+    if normalized == "execute.log":
+        return (RUNTIME_DIR / request_id / "execute.log").resolve()
     base_dir = (RUNTIME_DIR / request_id / "output").resolve()
     target = (base_dir / Path(normalized.replace("\\", "/"))).resolve()
     if not (target == base_dir or base_dir in target.parents):
@@ -79,8 +82,11 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
         timings["sas_submit"] = perf_counter() - t
         log_text = submit_result.get("LOG", "")
         t = perf_counter()
-        log_artifact_path = _write_log(log_text, request_dir, request_id)
+        log_artifact_path = _write_log(log_text, request_dir)
         timings["write_log"] = perf_counter() - t
+        t = perf_counter()
+        _upload_log_to_remote_program_dir(sas, output_dir, log_artifact_path)
+        timings["upload_log_to_remote"] = perf_counter() - t
 
         # 5) 执行后一次递归扫描获取全量文件，并统计耗时
         t = perf_counter()
@@ -96,8 +102,6 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
         t = perf_counter()
         artifacts = _download_artifacts(sas, request_id, output_dir, all_files)
         timings["download_artifacts"] = perf_counter() - t
-        if log_artifact_path is not None:
-            artifacts.append(_build_log_artifact(request_id, log_artifact_path))
         timings["total"] = perf_counter() - total_started_at
         print(
             "[phase_timing] "
@@ -108,12 +112,11 @@ def execute_sas_job(request_id: str, payload: ExecuteRequest) -> ExecuteResponse
         return ExecuteResponse(
             success=True,
             request_id=request_id,
-            log=log_text,
             artifacts=artifacts,
         )
     except Exception:
         # 异常场景也尽量保留日志，方便定位问题
-        _write_log(log_text, request_dir, request_id)
+        _write_log(log_text, request_dir)
         timings["total"] = perf_counter() - total_started_at
         if timings:
             print(
@@ -729,28 +732,26 @@ def _diff_artifacts(before: list[dict[str, Any]], after: list[dict[str, Any]]) -
     return changed
 
 
-def _write_log(log_text: str, request_dir: Path, request_id: str) -> Path:
-    # 同时写 execute.log 与可下载日志文件（sas_log_<request_id>.log）
+def _write_log(log_text: str, request_dir: Path) -> Path:
+    # 仅保留一份日志：execute.log（并作为可下载 artifact 暴露）
     log_path = request_dir / "execute.log"
     log_path.write_text(log_text, encoding="utf-8", errors="replace")
-    local_output_dir = request_dir / "output"
-    local_output_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = local_output_dir / f"sas_log_{request_id}.log"
-    artifact_path.write_text(log_text, encoding="utf-8", errors="replace")
-    return artifact_path
+    return log_path
 
 
-def _build_log_artifact(request_id: str, log_path: Path) -> ArtifactItem:
-    stat = log_path.stat()
-    modified_time = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-    filename = safe_filename(log_path.name)
-    return ArtifactItem(
-        filename=filename,
-        remote_path=str(log_path),
-        size=stat.st_size,
-        modified_time=modified_time,
-        download_url=f"/artifacts/{request_id}/{filename}",
-    )
+def _upload_log_to_remote_program_dir(sas: saspy.SASsession, output_dir: str, log_path: Path) -> None:
+    # 将执行日志写入远端 output_dir\program\execute.log，供产物下载阶段统一收集
+    remote_log_path = _join_remote_path(output_dir, "program\\execute.log")
+    # 为避免 SAS 会话编码转换失败，统一上传 ASCII 安全文本。
+    raw_text = log_path.read_text(encoding="utf-8", errors="replace")
+    safe_text = raw_text.encode("ascii", errors="backslashreplace").decode("ascii")
+    fallback_path = log_path.with_name("execute_upload_safe.log")
+    fallback_path.write_text(safe_text, encoding="ascii", errors="strict")
+    try:
+        sas.upload(str(fallback_path), remote_log_path)
+    finally:
+        if fallback_path.exists():
+            fallback_path.unlink()
 
 
 def _write_compare_log(

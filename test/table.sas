@@ -3,7 +3,7 @@
 options nodate nonumber missing=' ' orientation=landscape;
 
 %let xpt_path = D:\SAS_Data\TestD\development\test\input\adam\adae.xpt;
-%let out_rtf  = D:\SAS_Data\TestD\development\test\output-20260408_181210\data\adam\table_16.2.7.1.rtf;
+%let out_rtf  = D:\SAS_Data\TestD\development\test\output-20260408_181210\report\table_16.2.7.1.rtf;
 
 libname src xport "&xpt_path";
 

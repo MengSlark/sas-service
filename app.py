@@ -1,5 +1,4 @@
 import uuid
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -21,16 +20,11 @@ def execute(payload: ExecuteRequest) -> ExecuteResponse:
     try:
         return execute_sas_job(request_id, payload)
     except Exception as ex:
-        log_path = Path(__file__).resolve().parent / "runtime" / request_id / "execute.log"
-        log_text = ""
-        if log_path.exists():
-            log_text = log_path.read_text(encoding="utf-8", errors="replace")
         raise HTTPException(
             status_code=400,
             detail={
                 "message": str(ex),
                 "request_id": request_id,
-                "log": log_text,
             },
         )
 

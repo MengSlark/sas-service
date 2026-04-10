@@ -18,5 +18,4 @@ class ArtifactItem(BaseModel):
 class ExecuteResponse(BaseModel):
     success: bool
     request_id: str
-    log: str
     artifacts: list[ArtifactItem]

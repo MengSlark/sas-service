@@ -8,27 +8,25 @@ from typing import Any
 import requests
 
 
-def _extract_error_info(resp: requests.Response) -> tuple[str, str, str]:
+def _extract_error_info(resp: requests.Response) -> tuple[str, str]:
     request_id = ""
-    log_text = ""
     try:
         body = resp.json()
         detail = body.get("detail", "")
         if isinstance(detail, dict):
             request_id = str(detail.get("request_id", "")).strip()
-            log_text = str(detail.get("log", ""))
             message = str(detail.get("message", ""))
             fallback = json.dumps(detail, ensure_ascii=False)
-            return message or fallback, request_id, log_text
-        return str(detail), request_id, log_text
+            return message or fallback, request_id
+        return str(detail), request_id
     except ValueError:
-        return resp.text, request_id, log_text
+        return resp.text, request_id
 
 
 def _ensure_ok(resp: requests.Response, action: str) -> None:
     if resp.status_code < 400:
         return
-    detail, _, _ = _extract_error_info(resp)
+    detail, _ = _extract_error_info(resp)
     raise RuntimeError(f"{action} failed: HTTP {resp.status_code}. {detail}")
 
 
@@ -79,38 +77,34 @@ def run(
     execute_submit_seconds = perf_counter() - t1
 
     if resp.status_code >= 400:
-        detail, request_id, log_text = _extract_error_info(resp)
-        if not log_text:
-            log_text = detail or resp.text or f"execute failed: HTTP {resp.status_code}"
-        log_file = _save_log_file(cwd, request_id or "failed", log_text)
+        detail, request_id = _extract_error_info(resp)
+        error_text = detail or resp.text or f"execute failed: HTTP {resp.status_code}"
+        log_file = _save_log_file(cwd, request_id or "failed", error_text)
         raise RuntimeError(
             f"execute failed: HTTP {resp.status_code}. {detail} (log_file: {log_file})"
         )
 
     data = resp.json()
     request_id = str(data.get("request_id") or "")
-    log_text = str(data.get("log", ""))
     artifacts = list(data.get("artifacts", []))
 
     saved_files: list[str] = []
-    log_file_path = _save_log_file(cwd, request_id or "unknown", log_text)
-    log_file = str(log_file_path)
-    saved_files.append(log_file)
-    local_log_name = log_file_path.name.lower()
+    log_file = ""
 
     for item in artifacts:
         filename = Path(str(item.get("filename", ""))).name
+        artifact_name = str(item.get("filename", ""))
         download_url = str(item.get("download_url", ""))
         if not filename or not download_url:
-            continue
-        if filename.lower() == local_log_name:
-            # Log already persisted locally from response payload.
             continue
         dl = requests.get(f"{base_url}{download_url}", timeout=timeout)
         _ensure_ok(dl, f"download {filename}")
         target = _unique_path(cwd / filename)
         target.write_bytes(dl.content)
         saved_files.append(str(target))
+        normalized_artifact_name = artifact_name.replace("/", "\\").lower()
+        if normalized_artifact_name.endswith("\\execute.log") or filename.lower() == "execute.log":
+            log_file = str(target)
 
     return {
         "success": bool(data.get("success")),
